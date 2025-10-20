@@ -16,6 +16,9 @@
 (define-constant err-invalid-schedule (err u113))
 (define-constant err-recurring-not-found (err u114))
 (define-constant err-schedule-past-time (err u115))
+(define-constant err-invalid-tip-amount (err u116))
+(define-constant err-tip-already-sent (err u117))
+(define-constant err-session-not-completed (err u118))
 
 (define-constant time-slot-duration u60)
 (define-constant max-advance-booking u10080)
@@ -33,6 +36,8 @@
 (define-data-var dispute-timeout uint u1440)
 (define-data-var next-schedule-id uint u1)
 (define-data-var next-recurring-id uint u1)
+(define-data-var max-tip-percentage uint u5000)
+(define-data-var min-tip-amount uint u10000)
 
 (define-map tutoring-sessions
   { session-id: uint }
@@ -123,6 +128,26 @@
     auto-confirm-block: uint,
     reminder-sent: bool,
     schedule-id: uint
+  }
+)
+
+(define-map session-tips
+  { session-id: uint }
+  {
+    tip-amount: uint,
+    tip-sent: bool,
+    tip-block: uint,
+    tip-message: (optional (string-ascii 100))
+  }
+)
+
+(define-map tutor-tip-stats
+  { tutor: principal }
+  {
+    total-tips-received: uint,
+    tip-count: uint,
+    highest-tip: uint,
+    average-tip: uint
   }
 )
 
@@ -643,3 +668,84 @@
 
 (define-read-only (calculate-fee (amount uint))
   (/ (* amount (var-get contract-fee-rate)) u10000))
+
+(define-read-only (get-session-tip (session-id uint))
+  (map-get? session-tips { session-id: session-id }))
+
+(define-read-only (get-tutor-tip-stats (tutor principal))
+  (default-to 
+    { total-tips-received: u0, tip-count: u0, highest-tip: u0, average-tip: u0 }
+    (map-get? tutor-tip-stats { tutor: tutor })))
+
+(define-read-only (calculate-max-tip (session-amount uint))
+  (/ (* session-amount (var-get max-tip-percentage)) u10000))
+
+(define-read-only (get-tip-settings)
+  (ok {
+    max-tip-percentage: (var-get max-tip-percentage),
+    min-tip-amount: (var-get min-tip-amount)
+  }))
+
+(define-public (send-tip 
+  (session-id uint) 
+  (tip-amount uint)
+  (tip-message (optional (string-ascii 100))))
+  (let 
+    (
+      (session (unwrap! (map-get? tutoring-sessions { session-id: session-id }) err-not-found))
+      (existing-tip (map-get? session-tips { session-id: session-id }))
+      (max-allowed-tip (calculate-max-tip (get amount session)))
+      (tutor-address (get tutor session))
+      (current-tip-stats (get-tutor-tip-stats tutor-address))
+    )
+    (asserts! (is-eq tx-sender (get student session)) err-not-authorized)
+    (asserts! (is-eq (get status session) session-completed) err-session-not-completed)
+    (asserts! (is-none existing-tip) err-tip-already-sent)
+    (asserts! (>= tip-amount (var-get min-tip-amount)) err-invalid-tip-amount)
+    (asserts! (<= tip-amount max-allowed-tip) err-invalid-tip-amount)
+    (asserts! (> tip-amount u0) err-invalid-tip-amount)
+    
+    (try! (stx-transfer? tip-amount tx-sender tutor-address))
+    
+    (map-set session-tips
+      { session-id: session-id }
+      {
+        tip-amount: tip-amount,
+        tip-sent: true,
+        tip-block: stacks-block-height,
+        tip-message: tip-message
+      })
+    
+    (let 
+      (
+        (new-total-tips (+ (get total-tips-received current-tip-stats) tip-amount))
+        (new-tip-count (+ (get tip-count current-tip-stats) u1))
+        (new-highest (if (> tip-amount (get highest-tip current-tip-stats)) 
+                         tip-amount 
+                         (get highest-tip current-tip-stats)))
+        (new-average (/ new-total-tips new-tip-count))
+      )
+      (map-set tutor-tip-stats
+        { tutor: tutor-address }
+        {
+          total-tips-received: new-total-tips,
+          tip-count: new-tip-count,
+          highest-tip: new-highest,
+          average-tip: new-average
+        })
+    )
+    (ok true)
+  )
+)
+
+(define-public (set-max-tip-percentage (new-percentage uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= new-percentage u10000) err-invalid-amount)
+    (ok (var-set max-tip-percentage new-percentage))))
+
+(define-public (set-min-tip-amount (new-amount uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> new-amount u0) err-invalid-amount)
+    (ok (var-set min-tip-amount new-amount))))
