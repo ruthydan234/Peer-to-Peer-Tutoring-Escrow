@@ -749,3 +749,136 @@
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
     (asserts! (> new-amount u0) err-invalid-amount)
     (ok (var-set min-tip-amount new-amount))))
+
+(define-constant err-self-referral (err u119))
+(define-constant err-already-referred (err u120))
+(define-constant err-referral-not-found (err u121))
+(define-constant err-reward-already-claimed (err u122))
+(define-constant err-no-completed-session (err u123))
+(define-constant err-referral-inactive (err u124))
+
+(define-data-var referral-reward-amount uint u50000)
+(define-data-var referral-active bool true)
+(define-data-var next-referral-id uint u1)
+
+(define-map referrals
+  { referral-id: uint }
+  {
+    referrer: principal,
+    referred: principal,
+    created-at: uint,
+    reward-claimed: bool,
+    referred-completed-session: bool
+  }
+)
+
+(define-map user-referral-code
+  { user: principal }
+  { referral-id: uint }
+)
+
+(define-map referred-by
+  { user: principal }
+  { referral-id: uint }
+)
+
+(define-map referral-stats
+  { user: principal }
+  {
+    total-referrals: uint,
+    successful-referrals: uint,
+    total-rewards-earned: uint
+  }
+)
+
+(define-public (create-referral (referred principal))
+  (let ((referral-id (var-get next-referral-id)))
+    (asserts! (var-get referral-active) err-referral-inactive)
+    (asserts! (not (is-eq tx-sender referred)) err-self-referral)
+    (asserts! (is-none (map-get? referred-by { user: referred })) err-already-referred)
+    (map-set referrals
+      { referral-id: referral-id }
+      {
+        referrer: tx-sender,
+        referred: referred,
+        created-at: stacks-block-height,
+        reward-claimed: false,
+        referred-completed-session: false
+      })
+    (map-set user-referral-code
+      { user: tx-sender }
+      { referral-id: referral-id })
+    (map-set referred-by
+      { user: referred }
+      { referral-id: referral-id })
+    (let ((stats (default-to { total-referrals: u0, successful-referrals: u0, total-rewards-earned: u0 }
+                             (map-get? referral-stats { user: tx-sender }))))
+      (map-set referral-stats
+        { user: tx-sender }
+        (merge stats { total-referrals: (+ (get total-referrals stats) u1) })))
+    (var-set next-referral-id (+ referral-id u1))
+    (ok referral-id)
+  )
+)
+
+(define-public (mark-referral-session-completed (referred principal))
+  (let ((ref-data (unwrap! (map-get? referred-by { user: referred }) err-referral-not-found))
+        (referral (unwrap! (map-get? referrals { referral-id: (get referral-id ref-data) }) err-referral-not-found)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (not (get referred-completed-session referral)) err-already-confirmed)
+    (ok (map-set referrals
+      { referral-id: (get referral-id ref-data) }
+      (merge referral { referred-completed-session: true })))
+  )
+)
+
+(define-public (claim-referral-reward (referral-id uint))
+  (let ((referral (unwrap! (map-get? referrals { referral-id: referral-id }) err-referral-not-found))
+        (reward (var-get referral-reward-amount)))
+    (asserts! (var-get referral-active) err-referral-inactive)
+    (asserts! (is-eq tx-sender (get referrer referral)) err-not-authorized)
+    (asserts! (get referred-completed-session referral) err-no-completed-session)
+    (asserts! (not (get reward-claimed referral)) err-reward-already-claimed)
+    (try! (as-contract (stx-transfer? reward tx-sender (get referrer referral))))
+    (map-set referrals
+      { referral-id: referral-id }
+      (merge referral { reward-claimed: true }))
+    (let ((stats (default-to { total-referrals: u0, successful-referrals: u0, total-rewards-earned: u0 }
+                             (map-get? referral-stats { user: tx-sender }))))
+      (map-set referral-stats
+        { user: tx-sender }
+        (merge stats {
+          successful-referrals: (+ (get successful-referrals stats) u1),
+          total-rewards-earned: (+ (get total-rewards-earned stats) reward)
+        })))
+    (ok true)
+  )
+)
+
+(define-public (set-referral-reward-amount (new-amount uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> new-amount u0) err-invalid-amount)
+    (ok (var-set referral-reward-amount new-amount))))
+
+(define-public (toggle-referral-program (active bool))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (ok (var-set referral-active active))))
+
+(define-read-only (get-referral (referral-id uint))
+  (map-get? referrals { referral-id: referral-id }))
+
+(define-read-only (get-referral-stats (user principal))
+  (default-to
+    { total-referrals: u0, successful-referrals: u0, total-rewards-earned: u0 }
+    (map-get? referral-stats { user: user })))
+
+(define-read-only (get-referred-by (user principal))
+  (map-get? referred-by { user: user }))
+
+(define-read-only (get-referral-reward-info)
+  (ok {
+    reward-amount: (var-get referral-reward-amount),
+    program-active: (var-get referral-active)
+  }))
